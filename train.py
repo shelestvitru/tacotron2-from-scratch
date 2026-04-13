@@ -1,12 +1,13 @@
 import argparse
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
-from dataset import LJDataModule
+from dataset import LJDataModule, denormalize_mel
 from model import Tacotron2, Tacotron2Config
 
 
@@ -20,18 +21,21 @@ class Tacotron2Module(L.LightningModule):
         self.weight_decay = weight_decay
 
     def _compute_loss(self, batch, pred):
-        mel_target = batch["mel"]                   # (B, T_mel, n_mels)
-        mel_mask = batch["mel_mask"].unsqueeze(-1)  # (B, T_mel, 1)
-        stop_target = batch["stop_target"]          # (B, T_mel)
+        # (B, T_mel, n_mels)
+        mel_target = batch["mel"]                   
+        # (B, T_mel, 1)
+        mel_mask = batch["mel_mask"].unsqueeze(-1)  
+        # (B, T_mel)
+        stop_target = batch["stop_target"]          
 
         n_valid = mel_mask.sum() * self.config.n_mels
 
-        mel_l1 = (F.l1_loss(pred["mel"], mel_target, reduction="none") * mel_mask).sum() / n_valid
-        post_l1 = (F.l1_loss(pred["mel_post"], mel_target, reduction="none") * mel_mask).sum() / n_valid
+        mel_mse = (F.mse_loss(pred["mel"], mel_target, reduction="none") * mel_mask).sum() / n_valid
+        post_mse = (F.mse_loss(pred["mel_post"], mel_target, reduction="none") * mel_mask).sum() / n_valid
         stop_loss = F.binary_cross_entropy_with_logits(pred["stop_logits"], stop_target)
 
-        total = mel_l1 + post_l1 + stop_loss
-        return total, {"mel_l1": mel_l1, "post_l1": post_l1, "stop": stop_loss, "total": total}
+        total = mel_mse + post_mse + stop_loss
+        return total, {"mel_mse": mel_mse, "post_mse": post_mse, "stop": stop_loss, "total": total}
 
     def training_step(self, batch, batch_idx):
         pred = self.model(batch)
@@ -47,6 +51,39 @@ class Tacotron2Module(L.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+    def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking:
+            return
+        val_ds = self.trainer.datamodule.val_ds
+        sample = val_ds[0]
+        tokens = sample["text"].unsqueeze(0).to(self.device)
+        lengths = torch.tensor([tokens.size(1)], device=self.device)
+
+        was_training = self.training
+        self.eval()
+        out = self.model.inference(tokens, lengths, max_steps=1000, stop_threshold=0.5)
+        if was_training:
+            self.train()
+
+        target_mel = denormalize_mel(sample["mel"]).cpu().numpy().T
+        gen_mel = denormalize_mel(out["mel_post"][0]).cpu().numpy().T
+        attn = out["attentions"][0].cpu().numpy().T
+
+        fig, axes = plt.subplots(3, 1, figsize=(12, 9))
+        axes[0].imshow(target_mel, origin="lower", aspect="auto", cmap="jet")
+        axes[0].set_title(f"target mel ({target_mel.shape[1]} frames)")
+        axes[1].imshow(gen_mel, origin="lower", aspect="auto", cmap="jet")
+        axes[1].set_title(f"generated mel ({gen_mel.shape[1]} frames)")
+        axes[2].imshow(attn, origin="lower", aspect="auto", cmap="viridis", interpolation="nearest")
+        axes[2].set_title("attention (encoder step × decoder step)")
+        fig.suptitle(f"epoch {self.current_epoch}")
+        fig.tight_layout()
+
+        out_dir = Path(self.logger.log_dir) / "samples"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_dir / f"epoch_{self.current_epoch:03d}.png", dpi=110)
+        plt.close(fig)
 
 
 def main():
