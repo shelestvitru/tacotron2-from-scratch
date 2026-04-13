@@ -17,7 +17,7 @@ class Tacotron2Config:
     enc_dropout_p = 0.5
 
     # attn
-    attn_hidden_dim = 256
+    attn_hidden_dim = 128 
     attn_loc_conv_dim = 32
     attn_loc_conv_kernel = 31
 
@@ -208,7 +208,6 @@ class Decoder(nn.Module):
 
     def decoder_step(self, mel_step):
 
-        # Update attention state
         attn_weights_cat = torch.cat(
             [self.attn_weights.unsqueeze(1), self.cum_attn_weight.unsqueeze(1)], dim=1
         )
@@ -262,10 +261,32 @@ class Decoder(nn.Module):
 
 
     @torch.inference_mode()
-    def inference(
-        self,
-    ):
-        pass
+    def inference(self, encoder_outputs, encoder_mask=None, max_steps=1000, stop_threshold=0.5):
+        self._init_decoder(encoder_outputs, encoder_mask)
+
+        B = encoder_outputs.size(0)
+        device = encoder_outputs.device
+        mel_input = torch.zeros(B, self.config.n_mels, device=device)
+
+        mels, stops, attns = [], [], []
+        for _ in range(max_steps):
+            prenet_out = self.prenet(mel_input)
+            mel_t, stop_t, attn_t = self.decoder_step(prenet_out)
+
+            mels.append(mel_t)
+            stops.append(stop_t)
+            attns.append(attn_t)
+
+            if torch.sigmoid(stop_t).max().item() > stop_threshold:
+                break
+            mel_input = mel_t
+
+        mel_outs = torch.stack(mels, dim=1)
+        stop_logits = torch.stack(stops, dim=1).squeeze(-1)
+        attentions = torch.stack(attns, dim=1)
+        mel_post = mel_outs + self.postnet(mel_outs.transpose(1, 2)).transpose(1, 2)
+
+        return mel_outs, mel_post, stop_logits, attentions
 
 
 class Tacotron2(nn.Module):
@@ -278,8 +299,8 @@ class Tacotron2(nn.Module):
     def forward(self, batch):
         text = batch["text"]
         text_lengths = batch["text_lengths"]
-        mel = batch["mel"]            # (B, T_mel, n_mels)
-        mel_mask = batch["mel_mask"]  # (B, T_mel) bool
+        mel = batch["mel"]
+        mel_mask = batch["mel_mask"]
 
         enc_out = self.encoder(text, text_lengths)
 
@@ -288,7 +309,7 @@ class Tacotron2(nn.Module):
             torch.arange(T_enc, device=enc_out.device)[None, :]
             < text_lengths.to(enc_out.device)[:, None]
         )  # (B, T_enc)
-        encoder_mask = text_mask.unsqueeze(-1)  # (B, T_enc, 1)
+        encoder_mask = text_mask.unsqueeze(-1)  
 
         mel, mel_post, stop_logits, attentions = self.decoder(
             enc_out, encoder_mask, mel, mel_mask
@@ -302,8 +323,25 @@ class Tacotron2(nn.Module):
         }
 
     @torch.inference_mode()
-    def inference(self, text_tokens):
-        pass
+    def inference(self, text_tokens, text_lengths, max_steps=1000, stop_threshold=0.5):
+        enc_out = self.encoder(text_tokens, text_lengths)
+
+        T_enc = enc_out.size(1)
+        text_mask = (
+            torch.arange(T_enc, device=enc_out.device)[None, :]
+            < text_lengths.to(enc_out.device)[:, None]
+        )
+        encoder_mask = text_mask.unsqueeze(-1)
+
+        mel, mel_post, stop_logits, attentions = self.decoder.inference(
+            enc_out, encoder_mask, max_steps=max_steps, stop_threshold=stop_threshold,
+        )
+        return {
+            "mel": mel,
+            "mel_post": mel_post,
+            "stop_logits": stop_logits,
+            "attentions": attentions,
+        }
 
 
 if __name__ == "__main__":
@@ -323,7 +361,6 @@ if __name__ == "__main__":
     out = encoder(text_tokens, text_tokens_lengts)
     print(out.shape)
 
-    # --- test LocalSensitiveAttention ---
     B, T_enc, _ = out.shape
     attn = LocalSensitiveAttention(config)
 
@@ -341,4 +378,3 @@ if __name__ == "__main__":
 
     print("context:", context.shape, "expected:", (B, config.enc_hidden_dim))
     print("weights:", weights.shape, "expected:", (B, T_enc))
-
